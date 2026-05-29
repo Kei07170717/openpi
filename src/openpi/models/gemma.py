@@ -330,11 +330,16 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        # Return (carry, per_step_output) for nn.scan. The per-step output is
-        # the layer's hidden states (mean-pooled across tokens later); we return
-        # the full xs here and let the caller decide what to keep.
-        per_step_out = jax.tree.map(lambda x: x if x is not None else None, xs)
-        return (xs, kv_cache), per_step_out
+        # nn.scan threads the carry (here: `xs`, the per-expert hidden-states
+        # list) and stacks the second return along the depth axis. The original
+        # design used `kv_cache` as the stacked per-layer output; we additionally
+        # stack this block's output hidden states (`xs`) so callers can read the
+        # residual stream at every layer. Keeping the carry as `xs` (a list) is
+        # essential -- making it a tuple breaks scan's carry-structure check.
+        # When hidden states are not requested upstream, the stacked output is
+        # discarded and XLA dead-code-eliminates it, so the default path is
+        # unaffected in cost or behavior.
+        return xs, (kv_cache, xs)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -408,7 +413,10 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        (embedded, kv_cache), per_layer_hidden = self.layers(
+        # Carry is `embedded` (the hidden-states list); the scan output is the
+        # tuple (per-layer kv_cache, per-layer hidden states), each stacked along
+        # the depth axis (out_axes=0).
+        embedded, (kv_cache, per_layer_hidden) = self.layers(
             embedded, kv_cache, positions, mask, adarms_cond, deterministic
         )
 
@@ -418,7 +426,8 @@ class Module(nn.Module):
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ]
         if return_hidden_states:
-            # per_layer_hidden is a list (one per expert) of arrays shape (depth, b, t, d)
+            # per_layer_hidden is a list (one per expert) of arrays shape (depth, b, t, d).
+            # Experts that were not run (None input) stay None.
             return final_out, kv_cache, per_layer_hidden
         return final_out, kv_cache
 
