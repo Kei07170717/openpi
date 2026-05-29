@@ -51,6 +51,12 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Capture per-layer prefix activations from the PaliGemma backbone on each
+    # inference, for linear probing. Saves one .npz per infer() call.
+    capture_activations: bool = False
+    # Directory to write captured activations to (used when capture_activations is set).
+    activation_dir: str = "activations"
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -99,6 +105,12 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    # Capture prefix activations. This must wrap the underlying JAX Policy
+    # directly (it requires access to its sample_kwargs), so apply it before
+    # the recorder.
+    if args.capture_activations:
+        policy = _policy.ActivationCapturingPolicy(policy, args.activation_dir, capture=True)
 
     # Record the policy's behavior.
     if args.record:
