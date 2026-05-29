@@ -221,7 +221,15 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+        return_prefix_activations: bool = False,
+    ) -> _model.Actions | tuple[_model.Actions, at.Float[at.Array, "depth b emb"]]:
+        """Sample an action chunk via flow matching.
+
+        If `return_prefix_activations` is True, also returns the prefix-pass
+        per-layer hidden states from the PaliGemma backbone (expert 0),
+        mean-pooled across the token axis, with shape (depth, batch, width).
+        This is used for linear-probing the residual stream and is inference-only.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -234,7 +242,17 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        if return_prefix_activations:
+            _, kv_cache, prefix_hidden = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, return_hidden_states=True
+            )
+            # prefix_hidden[0]: PaliGemma backbone, shape (depth, b, t, d). Expert 1
+            # (action expert) is None on the prefix pass. Mean-pool over the token
+            # axis to bound memory -> (depth, b, d). NOTE: this is an unmasked mean;
+            # padding tokens are included, matching the simplest pooling convention.
+            prefix_activations = jnp.mean(prefix_hidden[0], axis=2)
+        else:
+            _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -276,4 +294,6 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        if return_prefix_activations:
+            return x_0, prefix_activations
         return x_0
