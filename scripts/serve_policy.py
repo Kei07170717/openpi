@@ -54,6 +54,9 @@ class Args:
     # Capture per-layer prefix activations from the PaliGemma backbone on each
     # inference, for linear probing. Saves one .npz per infer() call.
     capture_activations: bool = False
+    # Also capture the action expert's (expert 1) per-layer activations via one
+    # extra suffix forward pass. Only effective when capture_activations is set.
+    capture_action_activations: bool = False
     # Directory to write captured activations to (used when capture_activations is set).
     activation_dir: str = "activations"
 
@@ -110,7 +113,9 @@ def main(args: Args) -> None:
     # directly (it requires access to its sample_kwargs), so apply it before
     # the recorder.
     if args.capture_activations:
-        policy = _policy.ActivationCapturingPolicy(policy, args.activation_dir, capture=True)
+        policy = _policy.ActivationCapturingPolicy(
+            policy, args.activation_dir, capture=True, capture_action=args.capture_action_activations
+        )
 
     # Record the policy's behavior.
     if args.record:

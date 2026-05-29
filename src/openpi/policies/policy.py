@@ -60,11 +60,12 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup. `return_prefix_activations` (used for activation
-            # probing) is a Python bool that selects a branch, so it must be a
-            # static jit argument; it defaults to False and is otherwise inert.
+            # JAX model setup. The activation-probing flags select branches in
+            # sample_actions, so they must be static jit arguments; they default
+            # to False and are otherwise inert.
             self._sample_actions = nnx_utils.module_jit(
-                model.sample_actions, static_argnames=("return_prefix_activations",)
+                model.sample_actions,
+                static_argnames=("return_prefix_activations", "return_action_activations"),
             )
             self._rng = rng or jax.random.key(0)
 
@@ -94,12 +95,13 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         sample_output = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
-        # When `return_prefix_activations=True`, sample_actions returns a tuple of
-        # (actions, prefix_activations). The activations have a leading depth axis
-        # and so are handled separately from the per-element batch stripping below.
-        prefix_activations = None
+        # When an activation-probing flag is set, sample_actions returns a tuple of
+        # (actions, activations) where activations is a dict with keys among
+        # {"prefix", "action"}. The activations have a leading depth axis and so are
+        # handled separately from the per-element batch stripping below.
+        activations: dict[str, Any] = {}
         if isinstance(sample_output, tuple):
-            actions, prefix_activations = sample_output
+            actions, activations = sample_output
         else:
             actions = sample_output
         outputs = {
@@ -116,9 +118,9 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
-        if prefix_activations is not None:
+        for key, value in activations.items():
             # shape (depth, batch, width) -> drop batch -> (depth, width)
-            outputs["prefix_activations"] = np.asarray(prefix_activations[:, 0, :])
+            outputs[f"{key}_activations"] = np.asarray(value[:, 0, :])
         return outputs
 
     @property
@@ -152,39 +154,65 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
 
 class ActivationCapturingPolicy(_base_policy.BasePolicy):
-    """Wraps a policy to capture per-layer prefix activations to disk.
+    """Wraps a policy to capture per-layer activations to disk.
 
     On each `infer()` call (when `capture=True`), the underlying policy is run
-    with `return_prefix_activations=True`, and the resulting mean-pooled,
-    per-layer PaliGemma-backbone hidden states are saved as
-    `{save_dir}/act_{step_id:05d}.npz` under the key "hidden" with shape
-    (depth, width) == (18, 2048). When `capture=False` the wrapper is fully
+    with `return_prefix_activations=True` (and `return_action_activations=True`
+    when `capture_action=True`). The resulting mean-pooled, per-layer hidden
+    states are saved as `{save_dir}/act_{step_id:05d}.npz`:
+
+    - prefix only: a single key "hidden" with shape (depth, width) == (18, 2048),
+      preserved for backward compatibility.
+    - prefix + action: two keys "hidden_prefix" (18, 2048) and "hidden_action"
+      (18, 1024). This is the preferred format going forward.
+
+    `step_id` is a monotonic counter incremented once per saved inference across
+    the whole server lifetime (NOT reset per episode); it is the join key for the
+    client-side ground-truth logger. When `capture=False` the wrapper is fully
     transparent and forwards `infer()` unchanged.
     """
 
-    def __init__(self, policy: _base_policy.BasePolicy, save_dir: str, *, capture: bool = False):
+    def __init__(
+        self,
+        policy: _base_policy.BasePolicy,
+        save_dir: str,
+        *,
+        capture: bool = False,
+        capture_action: bool = False,
+    ):
         self._policy = policy
         self._capture = capture
+        self._capture_action = capture_action
         self._step_id = 0
         self._save_dir = pathlib.Path(save_dir)
 
         if self._capture:
-            logging.info(f"Capturing prefix activations to: {save_dir}")
+            logging.info(
+                f"Capturing activations to: {save_dir} (action expert: {capture_action})"
+            )
             self._save_dir.mkdir(parents=True, exist_ok=True)
             # Request activations from the underlying Policy on every infer().
             existing_kwargs = getattr(self._policy, "_sample_kwargs", None)
             if existing_kwargs is None:
                 raise ValueError("ActivationCapturingPolicy must wrap a JAX `Policy` that supports sample_kwargs.")
             existing_kwargs["return_prefix_activations"] = True
+            if self._capture_action:
+                existing_kwargs["return_action_activations"] = True
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
         results = self._policy.infer(obs)
         if self._capture:
-            hidden = results.pop("prefix_activations", None)
-            if hidden is not None:
+            prefix = results.pop("prefix_activations", None)
+            action = results.pop("action_activations", None)
+            if prefix is not None or action is not None:
                 output_path = self._save_dir / f"act_{self._step_id:05d}.npz"
-                np.savez(output_path, hidden=np.asarray(hidden))
+                if action is not None:
+                    # Preferred dual format (prefix backbone + action expert).
+                    np.savez(output_path, hidden_prefix=np.asarray(prefix), hidden_action=np.asarray(action))
+                else:
+                    # Backward-compatible single-key prefix-only format.
+                    np.savez(output_path, hidden=np.asarray(prefix))
                 self._step_id += 1
         return results
 
