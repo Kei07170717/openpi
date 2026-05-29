@@ -3,6 +3,7 @@ import enum
 import logging
 import socket
 
+import jax
 import tyro
 
 from openpi.policies import policy as _policy
@@ -60,6 +61,11 @@ class Args:
     # Directory to write captured activations to (used when capture_activations is set).
     activation_dir: str = "activations"
 
+    # Seed for the JAX policy sampling RNG. The RNG still advances per inference
+    # (so successive calls vary), but this makes the starting point reproducible:
+    # a given --sample-seed yields a reproducibly different rollout sequence.
+    sample_seed: int = 0
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -108,6 +114,13 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+
+    # Seed the JAX sampling RNG. Set on the underlying Policy before any wrapping
+    # (the activation/recorder wrappers don't own the RNG). PyTorch policies have
+    # no _rng, so only apply when present.
+    if hasattr(policy, "_rng"):
+        policy._rng = jax.random.key(args.sample_seed)
+        logging.info("Set policy sample RNG from seed %d", args.sample_seed)
 
     # Capture prefix activations. This must wrap the underlying JAX Policy
     # directly (it requires access to its sample_kwargs), so apply it before
