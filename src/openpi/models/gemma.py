@@ -330,7 +330,11 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        # Return (carry, per_step_output) for nn.scan. The per-step output is
+        # the layer's hidden states (mean-pooled across tokens later); we return
+        # the full xs here and let the caller decide what to keep.
+        per_step_out = jax.tree.map(lambda x: x if x is not None else None, xs)
+        return (xs, kv_cache), per_step_out
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -373,6 +377,7 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
             ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+            out_axes=0,  # stack per-step outputs along axis 0 (depth dim)
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,19 +401,26 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_hidden_states: bool = False,
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        (embedded, kv_cache), per_layer_hidden = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        final_out = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_hidden_states:
+            # per_layer_hidden is a list (one per expert) of arrays shape (depth, b, t, d)
+            return final_out, kv_cache, per_layer_hidden
+        return final_out, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
