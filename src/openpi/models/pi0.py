@@ -222,13 +222,22 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         return_prefix_activations: bool = False,
-    ) -> _model.Actions | tuple[_model.Actions, at.Float[at.Array, "depth b emb"]]:
+        return_action_activations: bool = False,
+    ) -> _model.Actions | tuple[_model.Actions, dict[str, at.Float[at.Array, "depth b _emb"]]]:
         """Sample an action chunk via flow matching.
 
-        If `return_prefix_activations` is True, also returns the prefix-pass
-        per-layer hidden states from the PaliGemma backbone (expert 0),
-        mean-pooled across the token axis, with shape (depth, batch, width).
-        This is used for linear-probing the residual stream and is inference-only.
+        If `return_prefix_activations` is True, also captures the prefix-pass
+        per-layer hidden states from the PaliGemma backbone (expert 0).
+
+        If `return_action_activations` is True, also captures the action expert's
+        (expert 1) per-layer hidden states. Both are mean-pooled across the token
+        axis, shape (depth, batch, width) -- width 2048 for the prefix/backbone,
+        1024 for the action expert.
+
+        When either flag is set, returns (actions, activations) where activations
+        is a dict with keys among {"prefix", "action"}. With neither flag set the
+        return value is unchanged (just actions). Inference-only; flags are static
+        jit arguments so they select branches without being traced.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -242,6 +251,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        activations: dict[str, at.Float[at.Array, "depth b _emb"]] = {}
         if return_prefix_activations:
             _, kv_cache, prefix_hidden = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, return_hidden_states=True
@@ -250,7 +260,7 @@ class Pi0(_model.BaseModel):
             # (action expert) is None on the prefix pass. Mean-pool over the token
             # axis to bound memory -> (depth, b, d). NOTE: this is an unmasked mean;
             # padding tokens are included, matching the simplest pooling convention.
-            prefix_activations = jnp.mean(prefix_hidden[0], axis=2)
+            activations["prefix"] = jnp.mean(prefix_hidden[0], axis=2)
         else:
             _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
@@ -294,6 +304,36 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        if return_prefix_activations:
-            return x_0, prefix_activations
+
+        if return_action_activations:
+            # Capture the action expert's (expert 1) "settled" representation by
+            # running ONE extra suffix forward pass on the final denoised action
+            # x_0 at time=0, OUTSIDE the while_loop. Chosen over threading capture
+            # through the loop carry because it is the simplest correct option:
+            # deterministic, loop-free, exactly one extra forward pass per
+            # inference, and it reflects the converged action rather than a noisy
+            # mid-denoising state. The velocity output is discarded -- this pass
+            # exists solely to read hidden states, so x_0 (the returned action) is
+            # unchanged.
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_0, jnp.broadcast_to(0.0, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
+            suffix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            _, _, suffix_hidden = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=suffix_positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+                return_hidden_states=True,
+            )
+            # suffix_hidden[1]: action expert, shape (depth, b, suffix_len, 1024).
+            # Mean-pool over the token axis -> (depth, b, 1024).
+            activations["action"] = jnp.mean(suffix_hidden[1], axis=2)
+
+        if activations:
+            return x_0, activations
         return x_0
