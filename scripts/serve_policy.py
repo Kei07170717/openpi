@@ -4,6 +4,8 @@ import logging
 import socket
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import tyro
 
 from openpi.policies import policy as _policy
@@ -66,6 +68,16 @@ class Args:
     # a given --sample-seed yields a reproducibly different rollout sequence.
     sample_seed: int = 0
 
+    # Activation steering (default OFF). When --steering-vector is given, the
+    # direction for --steering-stream is loaded from the .npz (key "<stream>_w"),
+    # normalized to unit norm, and injected as alpha * w_hat at --steering-layer
+    # of that stream's residual stream on every relevant forward pass. With no
+    # --steering-vector, the forward pass is byte-identical to unsteered.
+    steering_vector: str | None = None
+    steering_stream: str = "prefix"  # {"prefix", "action"}
+    steering_layer: int = 0
+    steering_alpha: float = 0.0
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -121,6 +133,37 @@ def main(args: Args) -> None:
     if hasattr(policy, "_rng"):
         policy._rng = jax.random.key(args.sample_seed)
         logging.info("Set policy sample RNG from seed %d", args.sample_seed)
+
+    # Activation steering. Load the per-stream direction, normalize to unit norm,
+    # and pass it (plus stream/layer/alpha) via the underlying Policy's
+    # sample_kwargs so sample_actions injects it. Set on the raw Policy before any
+    # wrapping; the capture wrapper adds its own keys to the same dict, so steering
+    # and capture compose. Absent --steering-vector, nothing is injected.
+    if args.steering_vector is not None:
+        if not hasattr(policy, "_sample_kwargs"):
+            raise ValueError("Steering requires a JAX `Policy` with sample_kwargs.")
+        if args.steering_stream not in ("prefix", "action"):
+            raise ValueError(f"--steering-stream must be 'prefix' or 'action', got {args.steering_stream!r}")
+        with np.load(args.steering_vector) as data:
+            key = f"{args.steering_stream}_w"
+            if key not in data:
+                raise ValueError(f"Steering file {args.steering_vector} has no key {key!r}; keys: {list(data.keys())}")
+            w = np.asarray(data[key], dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(w))
+        if norm == 0.0:
+            raise ValueError(f"Steering direction {key!r} has zero norm.")
+        w_hat = w / norm
+        policy._sample_kwargs["steering_stream"] = args.steering_stream
+        policy._sample_kwargs["steering_layer"] = args.steering_layer
+        policy._sample_kwargs["steering_alpha"] = float(args.steering_alpha)
+        policy._sample_kwargs["steering_vector"] = jnp.asarray(w_hat)
+        logging.info(
+            "Steering ON: stream=%s layer=%d alpha=%.4f dim=%d (unit-normalized)",
+            args.steering_stream,
+            args.steering_layer,
+            args.steering_alpha,
+            w_hat.shape[0],
+        )
 
     # Capture prefix activations. This must wrap the underlying JAX Policy
     # directly (it requires access to its sample_kwargs), so apply it before
