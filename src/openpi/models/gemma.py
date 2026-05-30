@@ -290,7 +290,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, steering=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -329,6 +329,17 @@ class Block(nn.Module):
         out = jax.tree.map(lambda x: drop(x, deterministic), out)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
+
+        # Activation steering (default OFF). `steering` is the per-layer slice of a
+        # per-expert list: each entry is None except for the stream being steered,
+        # whose entry is this layer's (width,) row of a (depth, width) array that is
+        # zero on every layer except the chosen one. Broadcast-adding it to the
+        # residual is therefore a no-op except at the target layer. When every entry
+        # is None (the default), no traced op is emitted and the forward pass is
+        # byte-identical to the unsteered path. Captured hidden states (returned
+        # below) reflect the steered residual, so steering + capture compose.
+        if steering is not None:
+            xs = [x + s if (x is not None and s is not None) else x for x, s in zip(xs, steering, strict=True)]
 
         # nn.scan threads the carry (here: `xs`, the per-expert hidden-states
         # list) and stacks the second return along the depth axis. The original
@@ -381,7 +392,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                0,
+            ),  # kv_cache, positions, mask, adarms_cond, deterministic, steering(per-layer)
             out_axes=0,  # stack per-step outputs along axis 0 (depth dim)
             length=self.configs[0].depth,
         )(
@@ -407,17 +419,39 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         return_hidden_states: bool = False,
+        # Activation steering (default OFF). `steering_expert` selects which expert's
+        # residual stream to steer (0=PaliGemma backbone, 1=action expert), None to
+        # disable. `steering_vector` is the already-alpha-scaled direction with shape
+        # (width,) matching that expert; it is injected at the output of `steering_layer`.
+        steering_expert: int | None = None,
+        steering_layer: int = 0,
+        steering_vector: at.Float[at.Array, "_d"] | None = None,
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
+        # Build the per-expert, per-layer steering tensor. steering[expert] stays
+        # None unless that expert is being steered, in which case it is a
+        # (depth, width) array that is zero on every layer except `steering_layer`
+        # (which holds the scaled direction). The scan slices axis 0 per layer and
+        # Block broadcast-adds the slice. All-None (the default) => byte-identical.
+        steering = [None] * len(self.configs)
+        if steering_expert is not None and steering_vector is not None:
+            depth = self.configs[0].depth
+            width = self.configs[steering_expert].width
+            steering[steering_expert] = (
+                jnp.zeros((depth, width), dtype=self.embed_dtype)
+                .at[steering_layer]
+                .set(steering_vector.astype(self.embed_dtype))
+            )
+
         # Carry is `embedded` (the hidden-states list); the scan output is the
         # tuple (per-layer kv_cache, per-layer hidden states), each stacked along
         # the depth axis (out_axes=0).
         embedded, (kv_cache, per_layer_hidden) = self.layers(
-            embedded, kv_cache, positions, mask, adarms_cond, deterministic
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, steering
         )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
