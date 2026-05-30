@@ -65,7 +65,14 @@ class Policy(BasePolicy):
             # to False and are otherwise inert.
             self._sample_actions = nnx_utils.module_jit(
                 model.sample_actions,
-                static_argnames=("return_prefix_activations", "return_action_activations"),
+                static_argnames=(
+                    "return_prefix_activations",
+                    "return_action_activations",
+                    # Steering stream/layer change the injected pytree shape, so they
+                    # must be static; steering_alpha/steering_vector stay dynamic.
+                    "steering_stream",
+                    "steering_layer",
+                ),
             )
             self._rng = rng or jax.random.key(0)
 
