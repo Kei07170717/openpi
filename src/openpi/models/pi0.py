@@ -223,6 +223,10 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         return_prefix_activations: bool = False,
         return_action_activations: bool = False,
+        steering_stream: str | None = None,
+        steering_layer: int = 0,
+        steering_alpha: float | at.Float[at.Array, ""] = 0.0,
+        steering_vector: at.Float[at.Array, "_d"] | None = None,
     ) -> _model.Actions | tuple[_model.Actions, dict[str, at.Float[at.Array, "depth b _emb"]]]:
         """Sample an action chunk via flow matching.
 
@@ -238,6 +242,16 @@ class Pi0(_model.BaseModel):
         is a dict with keys among {"prefix", "action"}. With neither flag set the
         return value is unchanged (just actions). Inference-only; flags are static
         jit arguments so they select branches without being traced.
+
+        Activation steering (default OFF): if `steering_stream` is "prefix" (or
+        "action"), `steering_alpha * steering_vector` is injected at the output of
+        layer `steering_layer` of expert 0 (the prefix pass) or expert 1 (every
+        suffix denoising pass), respectively. `steering_vector` must be (width,)
+        for the chosen stream (2048 for prefix, 1024 for action). With
+        steering_stream None the forward pass is byte-identical to unsteered. Both
+        `steering_stream` and `steering_layer` are static jit args; `steering_alpha`
+        is dynamic so it can be swept without recompilation. Steering composes with
+        activation capture.
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -247,6 +261,15 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
+        # Activation steering setup (default OFF). "prefix" steers expert 0 during
+        # the prefix pass; "action" steers expert 1 during every suffix denoising
+        # pass. The scaled direction is computed here and passed (as loop-invariant
+        # closure constants for the suffix path) into the llm calls below; the
+        # gemma Module ignores it unless the matching steering_expert is set.
+        prefix_steer_expert = 0 if steering_stream == "prefix" else None
+        action_steer_expert = 1 if steering_stream == "action" else None
+        steering_scaled = None if steering_vector is None else steering_alpha * steering_vector
+
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
@@ -254,7 +277,13 @@ class Pi0(_model.BaseModel):
         activations: dict[str, at.Float[at.Array, "depth b _emb"]] = {}
         if return_prefix_activations:
             _, kv_cache, prefix_hidden = self.PaliGemma.llm(
-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, return_hidden_states=True
+                [prefix_tokens, None],
+                mask=prefix_attn_mask,
+                positions=positions,
+                return_hidden_states=True,
+                steering_expert=prefix_steer_expert,
+                steering_layer=steering_layer,
+                steering_vector=steering_scaled,
             )
             # prefix_hidden[0]: PaliGemma backbone, shape (depth, b, t, d). Expert 1
             # (action expert) is None on the prefix pass. Mean-pool over the token
@@ -262,7 +291,14 @@ class Pi0(_model.BaseModel):
             # padding tokens are included, matching the simplest pooling convention.
             activations["prefix"] = jnp.mean(prefix_hidden[0], axis=2)
         else:
-            _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+            _, kv_cache = self.PaliGemma.llm(
+                [prefix_tokens, None],
+                mask=prefix_attn_mask,
+                positions=positions,
+                steering_expert=prefix_steer_expert,
+                steering_layer=steering_layer,
+                steering_vector=steering_scaled,
+            )
 
         def step(carry):
             x_t, time = carry
@@ -286,12 +322,18 @@ class Pi0(_model.BaseModel):
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
+            # steering_* are loop-invariant constants captured from the enclosing
+            # scope (Stage 2): the action-expert direction is injected on every
+            # denoising iteration. When action_steer_expert is None this is a no-op.
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                steering_expert=action_steer_expert,
+                steering_layer=steering_layer,
+                steering_vector=steering_scaled,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -329,6 +371,9 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
                 return_hidden_states=True,
+                steering_expert=action_steer_expert,
+                steering_layer=steering_layer,
+                steering_vector=steering_scaled,
             )
             # suffix_hidden[1]: action expert, shape (depth, b, suffix_len, 1024).
             # Mean-pool over the token axis -> (depth, b, 1024).
